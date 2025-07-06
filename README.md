@@ -32,10 +32,12 @@ flowchart TD
     D6 --> E1{For each Epoch}
     E1 --> E2[Train Loop]
     E2 --> E3[For each batch: Mixup?]
-    E3 --> E4[Forward Pass & Compute Loss]
-    E4 --> E5[Backward, GradAccum, Clip]
-    E5 --> E6[Optimizer Step]
-    E2 --> E7[Track Metrics]
+    E3 -- Yes --> E4[Apply Mixup/Cutmix]
+    E3 -- No --> E5[Use Original Batch]
+    E4 & E5 --> E6[Forward Pass & Compute Loss]
+    E6 --> E7[Backward, GradAccum, Clip]
+    E7 --> E8[Optimizer Step]
+    E2 --> E9[Track Metrics]
     E1 --> F1[Validation]
     F1 --> F2[Compute Metrics & Save]
 
