@@ -1,2 +1,99 @@
 # Swin-SOTA-Spinach
 Spinach Disease Classification
+
+<pre>```
+  flowchart TD
+    %% Entry & Config
+    A0([Start: main()])
+    A0 --> A1[Initialize Config<br/>- Set Paths, Classes, Hyperparams]
+    A1 --> A2[Set Random Seed]
+    A2 --> A3[Setup Logging<br/>- Console & File]
+    A3 --> A4[Save Config as JSON]
+
+    %% Data
+    A4 --> B1[Create Datasets<br/>- Train, Val, Test (ImageFolder)]
+    B1 --> B2[Apply Data Augmentations]
+    B2 --> B2a[PathologyAugment:<br/>get_train_transform()]
+    B2 --> B2b[get_test_transform()]
+    B2a --> B2c[RandomResizedCrop, Flips,<br/>ColorJitter, Blur, Rot, Erasing]
+    B2b --> B2d[Resize, CenterCrop, Normalize]
+    B2 --> B3[get_tta_transforms()<br/>for TTA]
+
+    %% DataLoader
+    B1 --> C1[Create WeightedRandomSampler<br/>(Class Balance)]
+    C1 --> C2[Build DataLoaders<br/>- Train (Sampler)<br/>- Val/Test (Shuffle=False)]
+
+    %% Model & Optimizer
+    C2 --> D1[Create Model<br/>(timm.create_model SwinV2)]
+    D1 --> D2[Send Model to DEVICE (CUDA/CPU)]
+    D2 --> D3[Setup Optimizer (AdamW)]
+    D3 --> D4[Setup Scheduler<br/>(CosineAnnealingLR)]
+    D4 --> D5[Setup GradScaler<br/>(if Mixed Precision)]
+    D5 --> D6[Setup Losses:<br/>CrossEntropy (with Label Smoothing)]
+    D6 --> D7[Setup SupConLoss (if enabled)]
+    D7 --> D8[Setup Mixup/Cutmix (if enabled)]
+
+    %% Training Loop
+    D8 --> E1{For each Epoch}
+    E1 --> E2[Train Loop (train_epoch)]
+    E2 --> E2a[For each batch]
+    E2a --> E3{Mixup Enabled?}
+    E3 -- Yes --> E4[Apply Mixup/Cutmix<br/>to images & targets]
+    E3 -- No --> E5[Use original batch]
+    E4 & E5 --> E6[Forward Pass (autocast if mixed precision)]
+    E6 --> E7[Compute Outputs]
+    E7 --> E8[CrossEntropy Loss]
+    E7 --> E9[Extract Features<br/>(model.forward_features)]
+    E9 --> E10[Apply Global AvgPool<br/>(if needed)]
+    E10 --> E11[SupConLoss (on features)]
+    E8 & E11 --> E12[Weighted Loss:<br/>loss = (1-λ) * CE + λ * SupCon]
+    E12 --> E13[Backward + GradAccum<br/>(scaler if mixed precision)]
+    E13 --> E14[Clip Gradients]
+    E14 --> E15[Optimizer Step & Zero Grad]
+
+    E2a --> E16[Track Metrics: Loss, Probs, Targets]
+    E1 --> F1[Validation (evaluate)]
+    F1 --> F2[No Grad, Model.eval()]
+    F2 --> F3[Forward, Compute Metrics<br/>- Loss, Acc, Balanced Acc,<br/>F1, AUC, Probs, ConfMatrix]
+    F3 --> F4[Track & Save Val Metrics]
+
+    %% Checkpointing
+    F4 --> G1{Val AUC > Best?}
+    G1 -- Yes --> G2[Save Best Model State<br/>with optimizer, epoch, config]
+    G1 -- No --> G3[Increment no_improve counter]
+    G3 --> G4{Early Stop?}
+    G4 -- Yes --> G5[Break Loop]
+    G4 -- No --> E1
+
+    %% Testing / TTA
+    G2 & G5 --> H1[Load Best Model State]
+    H1 --> H2{TTA Enabled?}
+    H2 -- Yes --> H3[Run TTA Predict<br/>- hflip, vflip, base<br/>- avg probs]
+    H2 -- No --> H4[Standard Test Inference]
+    H3 & H4 --> H5[Compute Final Metrics<br/>- F1, AUC, Classification Report]
+    H5 --> H6[Save Confusion Matrix Plot]
+    H5 --> H7[Save Classification Report TXT]
+
+    %% Cleanup
+    H7 --> I1[GC Collect, CUDA Empty Cache]
+    I1 --> J([End])
+
+    %% Legends/Classes
+    classDef config fill:#FFFAE6,stroke:#C9B600
+    classDef data fill:#E6FFF3,stroke:#008C5F
+    classDef model fill:#E6F0FF,stroke:#003E91
+    classDef train fill:#FFF5F8,stroke:#C1003A
+    classDef valtest fill:#EAF7FF,stroke:#0067A3
+    classDef save fill:#E8F3F7,stroke:#457991
+    classDef misc fill:#F3F3F3,stroke:#AAA
+
+    class A1,A2,A3,A4 config
+    class B1,B2,B2a,B2b,B2c,B2d,B3 data
+    class C1,C2 data
+    class D1,D2,D3,D4,D5,D6,D7,D8 model
+    class E1,E2,E2a,E3,E4,E5,E6,E7,E8,E9,E10,E11,E12,E13,E14,E15,E16 train
+    class F1,F2,F3,F4 valtest
+    class G1,G2,G3,G4,G5 save
+    class H1,H2,H3,H4,H5,H6,H7 valtest
+    class I1,J misc
+  ```</pre>
