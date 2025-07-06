@@ -1,3 +1,6 @@
+# Flowchart for Swin
+
+```mermaid
 flowchart TD
     %% Entry & Config
     A0([Start: main()])
