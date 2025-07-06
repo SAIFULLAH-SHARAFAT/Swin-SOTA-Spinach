@@ -29,7 +29,8 @@ flowchart TD
     E2 --> E3{Mixup enabled?}
     E3 -- Yes --> E4[Apply Mixup/Cutmix]
     E3 -- No --> E5[Use Original Batch]
-    E4 & E5 --> E6[Forward Pass and Compute Loss]
+    E4 --> E6[Forward Pass and Compute Loss]
+    E5 --> E6
     E6 --> E7[Backward GradAccum Clip]
     E7 --> E8[Optimizer Step]
     E2 --> E9[Track Metrics]
@@ -42,11 +43,13 @@ flowchart TD
     G3 -- Yes --> G4[Break Loop]
     G3 -- No --> E1
 
-    G2 & G4 --> H1[Load Best Model]
+    G2 --> H1[Load Best Model]
+    G4 --> H1
     H1 --> H2{TTA Enabled?}
     H2 -- Yes --> H3[Run TTA Inference]
     H2 -- No --> H4[Standard Test Inference]
-    H3 & H4 --> H5[Compute and Save Metrics/Plots]
+    H3 --> H5[Compute and Save Metrics/Plots]
+    H4 --> H5
 
     H5 --> I1[GC Collect CUDA Empty Cache]
     I1 --> J((End))
