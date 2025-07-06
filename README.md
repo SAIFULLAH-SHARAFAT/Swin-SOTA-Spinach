@@ -1,4 +1,80 @@
-# Flowchart for Swin
+# WHY SOTA
+```mermaid
+flowchart TD
+    %% Overall Architecture
+    A[Input Images] --> B[Preprocessing & Augmentation]
+    B --> C[Swin Transformer V2 Architecture]
+    C --> D[Hybrid Loss Optimization]
+    D --> E[Validation & TTA]
+    E --> F[Diagnostic Reports]
+
+    %% Preprocessing & Augmentation
+    subgraph B [Preprocessing & Augmentation]
+        B1[Class-Weighted Sampler] --> B2[Balanced Batch Sampling]
+        B3[Train Augmentations] --> B4[RandomResizedCrop\nScale:0.6-1.0\nRatio:0.8-1.2]
+        B3 --> B5[Horizontal/Vertical Flip]
+        B3 --> B6[Color Jitter\nBright/Contrast:0.2\nHue:0.05]
+        B3 --> B7[Gaussian Blur\nσ=3]
+        B3 --> B8[15° Rotation]
+        B3 --> B9[Random Erasing\np=0.25]
+        B10[Test Augmentations] --> B11[Resize\n115% Scale]
+        B10 --> B12[Center Crop]
+    end
+
+    %% Swin Transformer V2 Architecture
+    subgraph C [Swin Transformer V2 Architecture]
+        direction TB
+        C1[Patch Partition\n4x4 patches] --> C2[Stage 1]
+        C2 -->|Window Attention| C3[Stage 2]
+        C3 -->|Shifted Window\nAttention| C4[Stage 3]
+        C4 -->|Patch Merging| C5[Stage 4]
+        C5 --> C6[Global Avg Pool]
+        C6 --> C7[Classification Head]
+        
+        %% Stage Details
+        subgraph C2 [Stage 1]
+            C2a[Linear Embed\nC=96] --> C2b[2x Swin Blocks]
+        end
+        subgraph C3 [Stage 2]
+            C3a[Patch Merging\nC=192] --> C3b[2x Swin Blocks]
+        end
+        subgraph C4 [Stage 3]
+            C4a[Patch Merging\nC=384] --> C4b[6x Swin Blocks]
+        end
+        subgraph C5 [Stage 4]
+            C5a[Patch Merging\nC=768] --> C5b[2x Swin Blocks]
+        end
+        
+        %% Key Innovations
+        C21[Residual Post-Norm] --> C2b
+        C22[Cosine Attention Bias] --> C2b
+        C23[Scaled LayerNorm] --> C2b
+    end
+
+    %% Hybrid Loss Optimization
+    subgraph D [Hybrid Loss Optimization]
+        D1[Cross-Entropy Loss\nLabel Smoothing:0.1] --> D3
+        D2[Supervised Contrastive Loss\nTemp:0.07] --> D3
+        D3[Weighted Combination\nλ=0.3] --> D4[Backpropagation]
+        D4 --> D5[AdamW Optimizer\nLR=1e-4\nWD=0.05]
+        D5 --> D6[Gradient Clipping\nMax Norm:1.0]
+        D5 --> D7[Mixed Precision Training]
+        D5 --> D8[Cosine LR Scheduler]
+    end
+
+    %% Validation & TTA
+    subgraph E [Validation & TTA]
+        E1[Validation Metrics] --> E2[Accuracy\nBalanced Accuracy]
+        E1 --> E3[F1 Macro\nAUC-OVO]
+        E1 --> E4[Confusion Matrix]
+        E5[Early Stopping\nPatience:7] --> E6[Best Model Checkpoint]
+        E7[Test-Time Augmentation] --> E8[Base Image]
+        E7 --> E9[Horizontal Flip]
+        E7 --> E10[Vertical Flip]
+        E11[Probability Averaging] --> F
+    end
+```
+# Flowchart for Swin Transformer 
 
 ```mermaid
 flowchart TD
