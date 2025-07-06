@@ -1,4 +1,4 @@
-# Architecture (State-of-the-Art) 🌟
+# Architecture
 
 ### Hierarchical Vision Transformer Architecture
 - **Shifted Window Attention:** Efficiently captures local leaf textures and global disease patterns by processing local windows with cyclic shifts, enabling cross-window connections.
