@@ -1,0 +1,576 @@
+# === First, in a separate cell if needed ===
+# !pip install pytorch-grad-cam
+
+import os
+import gc
+import random
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import datasets, transforms
+from sklearn.metrics import (
+    classification_report, confusion_matrix, f1_score, roc_auc_score,
+    accuracy_score, balanced_accuracy_score, roc_curve
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import timm
+from torch.cuda.amp import autocast, GradScaler
+from timm.data.mixup import Mixup
+import datetime
+import logging
+from sklearn.preprocessing import label_binarize
+import cv2
+from PIL import Image  # <-- fix for Grad-CAM step!
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
+# ---------------------------- Configuration ----------------------------
+class Config:
+    DATA_PATHS = {
+        "train": "/kaggle/input/minida/mini_output1/train",
+        "val":   "/kaggle/input/minida/mini_output1/val",
+        "test":  "/kaggle/input/minida/mini_output1/test"
+    }
+    CLASS_NAMES = sorted(os.listdir(DATA_PATHS["train"]))
+    NUM_CLASSES = len(CLASS_NAMES)
+    MODEL_NAME = "swinv2_small_window16_256"
+    IMG_SIZE = 256
+    DROP_RATE = 0.2
+    DROP_PATH_RATE = 0.2
+    USE_MIXUP = True
+    MIXUP_ALPHA = 0.3
+    CUTMIX_ALPHA = 1.0
+    USE_TTA = True
+    ACCUM_STEPS = 2
+    TRAIN_BATCH_SIZE = 32 // ACCUM_STEPS
+    VAL_BATCH_SIZE = 64
+    EPOCHS = 40
+    LR = 1e-4
+    WEIGHT_DECAY = 0.05
+    LABEL_SMOOTHING = 0.1
+    CONTRASTIVE_LOSS_WEIGHT = 0.3
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    NUM_WORKERS = 2
+    MIXED_PRECISION = True
+    OUTPUT_DIR = "./output"
+    MODEL_SAVE = f"./output/best_swinv2.pth"
+    EARLY_STOP_PATIENCE = 7
+    GRAD_CLIP = 1.0
+    LOG_FILE = "training.log"
+    def __init__(self):
+        os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+        self._set_seed()
+        self._set_timestamp()
+        self._setup_logging()
+    def _set_seed(self):
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
+        np.random.seed(42)
+        random.seed(42)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        os.environ["PYTHONHASHSEED"] = "42"
+    def _set_timestamp(self):
+        self.TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    def _setup_logging(self):
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        if not self.logger.handlers:
+            file_handler = logging.FileHandler(os.path.join(self.OUTPUT_DIR, self.LOG_FILE))
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
+
+cfg = Config()
+VIS_BATCH_SIZE = min(16, cfg.VAL_BATCH_SIZE)
+
+def config_to_serializable_dict(cfg):
+    skip_types = (logging.Logger,)
+    out = {}
+    for k, v in cfg.__dict__.items():
+        if k.startswith("_") or isinstance(v, skip_types) or callable(v):
+            continue
+        try:
+            json.dumps(v)
+            out[k] = v
+        except Exception:
+            continue
+    return out
+with open(os.path.join(cfg.OUTPUT_DIR, f'run_config_{cfg.TIMESTAMP}.json'), 'w') as f:
+    json.dump(config_to_serializable_dict(cfg), f, indent=4)
+
+# --------- Supervised Contrastive Loss ----------
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+    def forward(self, features, labels):
+        features = nn.functional.normalize(features, dim=1)
+        similarity_matrix = torch.div(torch.matmul(features, features.T), self.temperature)
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(features.device)
+        logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
+        logits = similarity_matrix - logits_max.detach()
+        exp_logits = torch.exp(logits) * (1 - torch.eye(labels.shape[0], device=features.device))
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1).clamp(min=1)
+        loss = -mean_log_prob_pos.mean()
+        return loss
+
+# --------- Augmentations ----------
+class PathologyAugment:
+    @staticmethod
+    def get_train_transform():
+        return transforms.Compose([
+            transforms.RandomResizedCrop(cfg.IMG_SIZE, scale=(0.6, 1.0), ratio=(0.8, 1.2)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
+            transforms.RandomApply([transforms.GaussianBlur(3)], p=0.3),
+            transforms.RandomApply([transforms.RandomRotation(15)], p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3))
+        ])
+    @staticmethod
+    def get_test_transform():
+        return transforms.Compose([
+            transforms.Resize(int(cfg.IMG_SIZE * 1.15)),
+            transforms.CenterCrop(cfg.IMG_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+    @staticmethod
+    def get_tta_transforms():
+        base = PathologyAugment.get_test_transform()
+        hflip = transforms.Compose([
+            transforms.Resize(int(cfg.IMG_SIZE * 1.15)),
+            transforms.CenterCrop(cfg.IMG_SIZE),
+            transforms.RandomHorizontalFlip(p=1.0),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        vflip = transforms.Compose([
+            transforms.Resize(int(cfg.IMG_SIZE * 1.15)),
+            transforms.CenterCrop(cfg.IMG_SIZE),
+            transforms.RandomVerticalFlip(p=1.0),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        return [base, hflip, vflip]
+
+# --------- Metrics Tracker ----------
+class MetricsTracker:
+    def __init__(self):
+        self.reset()
+    def reset(self):
+        self.losses, self.preds, self.targets, self.probs = [], [], [], []
+    def update(self, loss, outputs, targets):
+        self.losses.append(loss)
+        probs = outputs.float().softmax(1).detach().cpu()
+        self.probs.append(probs)
+        self.preds.append(probs.argmax(1))
+        self.targets.append(targets.detach().cpu())
+    def compute(self):
+        probs = torch.cat(self.probs).numpy()
+        preds = torch.cat(self.preds).numpy()
+        targets = torch.cat(self.targets).numpy()
+        probs = probs / (probs.sum(axis=1, keepdims=True) + 1e-10)
+        try:
+            auc_score = roc_auc_score(targets, probs, multi_class='ovo')
+        except Exception:
+            auc_score = float('nan')
+        return {
+            "loss": np.mean(self.losses),
+            "accuracy": accuracy_score(targets, preds),
+            "balanced_accuracy": balanced_accuracy_score(targets, preds),
+            "f1_macro": f1_score(targets, preds, average='macro'),
+            "auc": auc_score,
+            "targets": targets,
+            "preds": preds,
+            "probs": probs
+        }
+
+def create_weighted_sampler(dataset):
+    class_counts = np.bincount([t for _, t in dataset.samples])
+    weights = 1. / class_counts
+    sample_weights = [weights[label] for _, label in dataset.samples]
+    return WeightedRandomSampler(sample_weights, len(sample_weights))
+
+def create_model():
+    model = timm.create_model(
+        cfg.MODEL_NAME, pretrained=True, num_classes=cfg.NUM_CLASSES,
+        drop_rate=cfg.DROP_RATE, drop_path_rate=cfg.DROP_PATH_RATE, img_size=cfg.IMG_SIZE
+    ).to(cfg.DEVICE)
+    return model
+
+def evaluate(model, loader, criterion=None):
+    model.eval()
+    tracker = MetricsTracker()
+    with torch.inference_mode(), autocast(enabled=cfg.MIXED_PRECISION):
+        for inputs, targets in tqdm(loader, desc="Evaluating", leave=False):
+            inputs, targets = inputs.to(cfg.DEVICE), targets.to(cfg.DEVICE)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets).item() if criterion else 0
+            tracker.update(loss, outputs, targets)
+    return tracker.compute()
+
+def save_confusion_matrix(metrics, phase):
+    cm = confusion_matrix(metrics['targets'], metrics['preds'])
+    cm_norm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-9)
+    plt.figure(figsize=(8,7))
+    sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap="viridis",
+                xticklabels=cfg.CLASS_NAMES, yticklabels=cfg.CLASS_NAMES)
+    plt.xlabel("Predicted", fontsize=14)
+    plt.ylabel("True", fontsize=14)
+    plt.title(f"{phase.capitalize()} Confusion Matrix (Normalized)", fontsize=16)
+    plt.tight_layout()
+    save_path = f"{cfg.OUTPUT_DIR}/{phase}_confusion_matrix_{cfg.TIMESTAMP}.png"
+    plt.savefig(save_path)
+    plt.close()
+
+def save_classification_report(metrics, phase):
+    report = classification_report(
+        metrics['targets'], metrics['preds'], target_names=cfg.CLASS_NAMES, digits=4
+    )
+    save_path = f"{cfg.OUTPUT_DIR}/{phase}_report_{cfg.TIMESTAMP}.txt"
+    with open(save_path, "w") as f:
+        f.write(f"{phase} Classification Report:\n")
+        f.write(report)
+        f.write("\nBalanced Accuracy: {:.4f}\n".format(metrics['balanced_accuracy']))
+        f.write("AUC: {:.4f}\n".format(metrics['auc']))
+    print(f"\n{phase.capitalize()} Classification Report:\n{report}")
+
+def plot_curves(history, timestamp, output_dir):
+    plt.figure()
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Loss Curve')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/loss_curve_{timestamp}.png")
+    plt.close()
+
+    plt.figure()
+    plt.plot(history['train_acc'], label='Train Acc')
+    plt.plot(history['val_acc'], label='Val Acc')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Accuracy Curve')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/acc_curve_{timestamp}.png")
+    plt.close()
+
+def plot_roc_auc(targets, probs, phase):
+    targets_bin = label_binarize(targets, classes=range(cfg.NUM_CLASSES))
+    plt.figure(figsize=(8, 6))
+    for i, class_name in enumerate(cfg.CLASS_NAMES):
+        try:
+            fpr, tpr, _ = roc_curve(targets_bin[:, i], probs[:, i])
+            auc_ = roc_auc_score(targets_bin[:, i], probs[:, i])
+            plt.plot(fpr, tpr, label=f"{class_name} (AUC={auc_:.2f})")
+        except Exception as e:
+            print(f"ROC Curve failed for class {class_name}: {e}")
+    plt.plot([0, 1], [0, 1], "k--", lw=1)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC Curve - {phase.capitalize()}")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{cfg.OUTPUT_DIR}/{phase}_roc_{cfg.TIMESTAMP}.png")
+    plt.close()
+
+def tta_distribution_plot(model, dataset):
+    tta_transforms = PathologyAugment.get_tta_transforms()
+    loader = DataLoader(dataset, batch_size=VIS_BATCH_SIZE, shuffle=False, num_workers=cfg.NUM_WORKERS)
+    fig, axs = plt.subplots(len(tta_transforms), 1, figsize=(8, 4*len(tta_transforms)))
+    for idx, tta_tf in enumerate(tta_transforms):
+        dataset.transform = tta_tf
+        all_probs = []
+        with torch.no_grad():
+            for inputs, _ in loader:
+                inputs = inputs.to(cfg.DEVICE)
+                outputs = model(inputs)
+                probs = outputs.softmax(dim=1).detach().cpu().numpy()
+                all_probs.append(probs)
+        all_probs = np.concatenate(all_probs, axis=0)
+        mean_probs = all_probs.mean(axis=0)
+        axs[idx].bar(cfg.CLASS_NAMES, mean_probs)
+        axs[idx].set_title(f"TTA Transform {idx+1}: Mean Class Probs")
+        axs[idx].set_ylabel("Probability")
+        axs[idx].set_ylim([0, 1])
+    plt.tight_layout()
+    plt.savefig(f"{cfg.OUTPUT_DIR}/tta_mean_probs_{cfg.TIMESTAMP}.png")
+    plt.close()
+
+def plot_tta_variance(model, dataset):
+    tta_transforms = PathologyAugment.get_tta_transforms()
+    loader = DataLoader(dataset, batch_size=VIS_BATCH_SIZE, shuffle=False, num_workers=cfg.NUM_WORKERS)
+    all_probs = []
+    with torch.no_grad():
+        for tta_tf in tta_transforms:
+            dataset.transform = tta_tf
+            probs_run = []
+            for inputs, _ in loader:
+                inputs = inputs.to(cfg.DEVICE)
+                outputs = model(inputs)
+                probs = outputs.softmax(dim=1).detach().cpu().numpy()
+                probs_run.append(probs)
+            all_probs.append(np.concatenate(probs_run, axis=0))
+    all_probs = np.stack(all_probs, axis=0)
+    max_class_idx = all_probs.mean(axis=0).argmax(axis=1)
+    tta_var = []
+    for i, idx in enumerate(max_class_idx):
+        tta_var.append(np.var(all_probs[:, i, idx]))
+    plt.figure(figsize=(8,4))
+    plt.hist(tta_var, bins=30)
+    plt.title('Variance in Predicted Probability (Most Confident Class) Across TTA')
+    plt.xlabel('Variance')
+    plt.ylabel('Num Samples')
+    plt.tight_layout()
+    plt.savefig(f"{cfg.OUTPUT_DIR}/tta_variance_hist_{cfg.TIMESTAMP}.png")
+    plt.close()
+
+def show_tta_flip_examples(model, dataset, num_examples=6):
+    tta_transforms = PathologyAugment.get_tta_transforms()
+    loader = DataLoader(dataset, batch_size=VIS_BATCH_SIZE, shuffle=False, num_workers=cfg.NUM_WORKERS)
+    base_probs = []
+    dataset.transform = tta_transforms[0]
+    with torch.no_grad():
+        for inputs, _ in loader:
+            inputs = inputs.to(cfg.DEVICE)
+            outputs = model(inputs)
+            probs = outputs.softmax(dim=1).detach().cpu().numpy()
+            base_probs.append(probs)
+    base_probs = np.concatenate(base_probs, axis=0)
+    base_preds = np.argmax(base_probs, axis=1)
+    all_probs = []
+    with torch.no_grad():
+        for tta_tf in tta_transforms:
+            dataset.transform = tta_tf
+            tta_probs = []
+            for inputs, _ in loader:
+                inputs = inputs.to(cfg.DEVICE)
+                outputs = model(inputs)
+                probs = outputs.softmax(dim=1).detach().cpu().numpy()
+                tta_probs.append(probs)
+            all_probs.append(np.concatenate(tta_probs, axis=0))
+    mean_probs = np.mean(np.stack(all_probs, axis=0), axis=0)
+    tta_preds = np.argmax(mean_probs, axis=1)
+    changed = np.where(base_preds != tta_preds)[0]
+    if len(changed) == 0:
+        print("No TTA flip examples found!")
+        return
+    sample_idxs = np.random.choice(changed, size=min(num_examples, len(changed)), replace=False)
+    plt.figure(figsize=(15, 3 * len(sample_idxs)))
+    for i, idx in enumerate(sample_idxs):
+        img_path, true_label = dataset.samples[idx]
+        img = plt.imread(img_path)
+        plt.subplot(len(sample_idxs), 1, i+1)
+        plt.imshow(img)
+        plt.title(f"True: {cfg.CLASS_NAMES[true_label]}, Base Pred: {cfg.CLASS_NAMES[base_preds[idx]]}, TTA Pred: {cfg.CLASS_NAMES[tta_preds[idx]]}")
+        plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(f"{cfg.OUTPUT_DIR}/tta_flip_examples_{cfg.TIMESTAMP}.png")
+    plt.close()
+
+def gradcam_for_all_classes(model, dataset, output_dir, timestamp):
+    class2idx = {cls: [] for cls in range(cfg.NUM_CLASSES)}
+    for idx, (_, label) in enumerate(dataset.samples):
+        class2idx[label].append(idx)
+    for cls in range(cfg.NUM_CLASSES):
+        if len(class2idx[cls]) == 0:
+            continue
+        idx = random.choice(class2idx[cls])
+        img_path, _ = dataset.samples[idx]
+        img = cv2.imread(img_path)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_disp = cv2.resize(img_rgb, (cfg.IMG_SIZE, cfg.IMG_SIZE)) / 255.0
+        img_pil = Image.fromarray(img_rgb)
+        transform = transforms.Compose([
+            transforms.Resize(int(cfg.IMG_SIZE*1.15)),
+            transforms.CenterCrop(cfg.IMG_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        ])
+        img_tensor = transform(img_pil).unsqueeze(0).to(cfg.DEVICE)
+        try:
+            target_layers = [model.layers[-1].blocks[-1].norm1]
+        except Exception:
+            target_layers = [model.norm]
+        cam = GradCAM(model=model, target_layers=target_layers)
+        grayscale_cam = cam(input_tensor=img_tensor, targets=None)
+        cam_image = show_cam_on_image(img_disp.astype(np.float32), grayscale_cam[0], use_rgb=True)
+        plt.imshow(cam_image)
+        plt.title(f'Grad-CAM for class: {cfg.CLASS_NAMES[cls]}')
+        plt.axis('off')
+        plt.tight_layout()
+        fname = f"{output_dir}/gradcam_{cfg.CLASS_NAMES[cls]}_{timestamp}.png"
+        plt.savefig(fname, bbox_inches='tight', pad_inches=0)
+        plt.close()
+        print(f"Saved Grad-CAM for class {cfg.CLASS_NAMES[cls]}: {fname}")
+
+def train_epoch(model, loader, optimizer, criterion, scaler, mixup_fn, contrastive_loss, epoch):
+    model.train()
+    tracker = MetricsTracker()
+    optimizer.zero_grad()
+    for step, (inputs, targets) in enumerate(tqdm(loader, desc=f"Epoch {epoch+1}/{cfg.EPOCHS}", dynamic_ncols=True)):
+        inputs, orig_targets = inputs.to(cfg.DEVICE), targets.to(cfg.DEVICE)
+        if mixup_fn:
+            inputs, mixed_targets = mixup_fn(inputs, orig_targets)
+        else:
+            mixed_targets = orig_targets
+        with autocast(enabled=cfg.MIXED_PRECISION):
+            outputs = model(inputs)
+            ce_loss = criterion(outputs, mixed_targets)
+            ce_loss = ce_loss / cfg.ACCUM_STEPS
+            features = model.forward_features(inputs)
+            if isinstance(features, (tuple, list)):
+                features = features[0]
+            if features.dim() > 2:
+                features = features.mean(dim=(2, 3))
+            con_loss = contrastive_loss(features, orig_targets)
+            loss = (1 - cfg.CONTRASTIVE_LOSS_WEIGHT) * ce_loss + cfg.CONTRASTIVE_LOSS_WEIGHT * con_loss
+        if scaler:
+            scaler.scale(loss).backward()
+            if (step + 1) % cfg.ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+        else:
+            loss.backward()
+            if (step + 1) % cfg.ACCUM_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                optimizer.step()
+                optimizer.zero_grad()
+        tracker.update(loss.item() * cfg.ACCUM_STEPS, outputs, orig_targets)
+    return tracker.compute()
+
+def tta_predict(model, dataset):
+    tta_transforms = PathologyAugment.get_tta_transforms()
+    loader = DataLoader(dataset, batch_size=VIS_BATCH_SIZE, shuffle=False, num_workers=cfg.NUM_WORKERS)
+    all_probs = []
+    model.eval()
+    with torch.no_grad():
+        for tta_tf in tta_transforms:
+            dataset.transform = tta_tf
+            probs_run = []
+            for inputs, _ in loader:
+                inputs = inputs.to(cfg.DEVICE)
+                outputs = model(inputs)
+                probs = outputs.softmax(dim=1).detach().cpu().numpy()
+                probs_run.append(probs)
+            all_probs.append(np.concatenate(probs_run, axis=0))
+    avg_probs = np.mean(np.stack(all_probs, axis=0), axis=0)
+    targets = np.array([label for _, label in dataset.samples])
+    preds = np.argmax(avg_probs, axis=1)
+    return avg_probs, preds, targets
+
+# === OOM-SAFE MAIN ===
+def main():
+    cfg.logger.info(f"Starting Swin Transformer training at {cfg.TIMESTAMP}")
+    train_ds = datasets.ImageFolder(cfg.DATA_PATHS['train'], PathologyAugment.get_train_transform())
+    val_ds   = datasets.ImageFolder(cfg.DATA_PATHS['val'],   PathologyAugment.get_test_transform())
+    test_ds  = datasets.ImageFolder(cfg.DATA_PATHS['test'],  PathologyAugment.get_test_transform())
+    sampler = create_weighted_sampler(train_ds)
+    train_loader = DataLoader(train_ds, batch_size=cfg.TRAIN_BATCH_SIZE, sampler=sampler, num_workers=cfg.NUM_WORKERS, pin_memory=True, drop_last=True)
+    val_loader   = DataLoader(val_ds, batch_size=cfg.VAL_BATCH_SIZE, shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=True)
+    test_loader  = DataLoader(test_ds, batch_size=cfg.VAL_BATCH_SIZE, shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=True)
+    model = create_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.LABEL_SMOOTHING)
+    contrastive_loss = SupConLoss(temperature=0.07)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
+    scaler = GradScaler() if cfg.MIXED_PRECISION else None
+    mixup_fn = Mixup(
+        mixup_alpha=cfg.MIXUP_ALPHA, cutmix_alpha=cfg.CUTMIX_ALPHA,
+        label_smoothing=cfg.LABEL_SMOOTHING, num_classes=cfg.NUM_CLASSES
+    ) if cfg.USE_MIXUP else None
+
+    history = {'train_loss':[], 'val_loss':[], 'train_acc':[], 'val_acc':[]}
+    best_auc = 0; no_improve = 0
+    for epoch in range(cfg.EPOCHS):
+        train_metrics = train_epoch(model, train_loader, optimizer, criterion, scaler, mixup_fn, contrastive_loss, epoch)
+        val_metrics = evaluate(model, val_loader, criterion)
+        cfg.logger.info(f"Epoch {epoch+1} Train | Loss: {train_metrics['loss']:.4f} | Acc: {train_metrics['accuracy']:.4f} | AUC: {train_metrics['auc']:.4f}")
+        cfg.logger.info(f"Epoch {epoch+1} Val   | Loss: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']:.4f} | AUC: {val_metrics['auc']:.4f}")
+        history['train_loss'].append(train_metrics['loss'])
+        history['val_loss'].append(val_metrics['loss'])
+        history['train_acc'].append(train_metrics['accuracy'])
+        history['val_acc'].append(val_metrics['accuracy'])
+        scheduler.step()
+        if val_metrics['auc'] > best_auc:
+            best_auc = val_metrics['auc']
+            no_improve = 0
+            torch.save({
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'config': config_to_serializable_dict(cfg)
+            }, cfg.MODEL_SAVE)
+            cfg.logger.info(f"Saved best model with AUC: {best_auc:.4f}")
+        else:
+            no_improve += 1
+            if no_improve >= cfg.EARLY_STOP_PATIENCE:
+                cfg.logger.info(f"Early stopping at epoch {epoch+1}")
+                break
+
+    plot_curves(history, cfg.TIMESTAMP, cfg.OUTPUT_DIR)
+
+    # Load best weights
+    model.load_state_dict(torch.load(cfg.MODEL_SAVE)['model'])
+
+    # ----- Test & TTA -----
+    if cfg.USE_TTA:
+        avg_probs, preds, targets = tta_predict(model, test_ds)
+        f1 = f1_score(targets, preds, average='macro')
+        auc_ = roc_auc_score(targets, avg_probs, multi_class='ovo')
+        print(f"\nTest (TTA) F1 Macro: {f1:.4f} | AUC: {auc_:.4f}")
+        print(classification_report(targets, preds, target_names=cfg.CLASS_NAMES))
+        save_confusion_matrix({'targets': targets, 'preds': preds}, "test_tta")
+        save_classification_report({'targets': targets, 'preds': preds, 'balanced_accuracy': balanced_accuracy_score(targets, preds), 'auc': auc_}, "test_tta")
+        plot_roc_auc(targets, avg_probs, phase="test_tta")
+        subset_size = min(200, len(test_ds))
+        subset_ds = torch.utils.data.Subset(test_ds, range(subset_size))
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        gc.collect()
+        tta_distribution_plot(model, subset_ds)
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        gc.collect()
+        plot_tta_variance(model, subset_ds)
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        gc.collect()
+        show_tta_flip_examples(model, subset_ds)
+    else:
+        test_metrics = evaluate(model, test_loader, criterion)
+        save_confusion_matrix(test_metrics, "test")
+        save_classification_report(test_metrics, "test")
+        plot_roc_auc(test_metrics['targets'], test_metrics['probs'], phase="test")
+        print(f"\nFinal Test Accuracy: {test_metrics['accuracy']:.4f}")
+        print(f"F1 Macro: {test_metrics['f1_macro']:.4f}")
+        print(f"AUC: {test_metrics['auc']:.4f}")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    gradcam_for_all_classes(model, test_ds, cfg.OUTPUT_DIR, cfg.TIMESTAMP)
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+    main()
